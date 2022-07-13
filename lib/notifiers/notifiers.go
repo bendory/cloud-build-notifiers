@@ -15,26 +15,29 @@
 package notifiers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
-	secretmanager "cloud.google.com/go/secretmanager/apiv1beta1"
+	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/storage"
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker/decls"
-	smpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1beta1"
+	smpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 	cbpb "google.golang.org/genproto/googleapis/devtools/cloudbuild/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"gopkg.in/yaml.v2"
@@ -52,12 +55,19 @@ var (
 	allowedYAMLAPIVersions = map[string]bool{
 		"cloud-build-notifiers/v1": true,
 	}
+	allowedTemplateTypes = map[string]bool{
+		"golang": true,
+	}
 )
 
 // Flags.
 var (
 	smoketest  = flag.Bool("smoketest", false, "If true, Main will simply log the notifier type and exit.")
 	setupCheck = flag.Bool("setup_check", false, "If true, the configuration YAML is read from stdin and notifier.SetUp is called in a faked-out way. The smoketest flag takes priority over this one.")
+)
+
+var (
+	gcsConfigPattern = regexp.MustCompile(`^gs://([[\w-]+)/([^\\]+$)`)
 )
 
 // Config is the common type for (YAML-based) configuration files for notifications.
@@ -83,6 +93,26 @@ type Spec struct {
 type Notification struct {
 	Filter   string                 `yaml:"filter"`
 	Delivery map[string]interface{} `yaml:"delivery"`
+	Params   map[string]string      `yaml:"params"`
+	Template *Template              `yaml:"template"`
+}
+
+type Template struct {
+	Type    string `yaml:"type"`
+	URI     string `yaml:"uri"`
+	Content string `yaml:"content"`
+}
+
+// TemplateView is the data container for the fields relevant to rendering a template
+
+type TemplateView struct {
+	Build  *BuildView        `json:"Build"`
+	Params map[string]string `json:"Params"`
+}
+
+// BuildView is the data container that contains the build
+type BuildView struct {
+	*cbpb.Build
 }
 
 // SecretConfig is the data container used in a Spec.Notification config for referencing a secret in the Spec.Secrets list.
@@ -98,8 +128,9 @@ type Secret struct {
 
 // Copied from https://cloud.google.com/run/docs/tutorials/pubsub#looking_at_the_code.
 type pubSubPushMessage struct {
-	Data []byte `json:"data,omitempty"`
-	ID   string `json:"id"`
+	Data        []byte `json:"data,omitempty"`
+	ID          string `json:"id"`
+	PublishTime string `json:"publishTime"`
 }
 
 type pubSubPushWrapper struct {
@@ -109,7 +140,7 @@ type pubSubPushWrapper struct {
 
 // Notifier is the interface type that users should implement for usage in Cloud Build notifiers.
 type Notifier interface {
-	SetUp(context.Context, *Config, SecretGetter) error
+	SetUp(context.Context, *Config, string, SecretGetter, BindingResolver) error
 	SendNotification(context.Context, *cbpb.Build) error
 }
 
@@ -155,7 +186,6 @@ func Main(notifier Notifier) error {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
-
 	if *smoketest {
 		log.V(0).Infof("notifier smoketest: %T", notifier)
 		return nil
@@ -178,7 +208,12 @@ func Main(notifier Notifier) error {
 			return fmt.Errorf("failed to validate config during setup check: %w", err)
 		}
 
-		if err := notifier.SetUp(ctx, cfg, new(setupCheckSecretGetter)); err != nil {
+		br, err := newResolver(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to create BindingResolver during setup check: %w", err)
+		}
+
+		if err := notifier.SetUp(ctx, cfg, "", new(setupCheckSecretGetter), br); err != nil {
 			return fmt.Errorf("failed to run notifier.SetUp during setup check: %w", err)
 		}
 
@@ -207,19 +242,34 @@ func Main(notifier Notifier) error {
 	if err != nil {
 		return fmt.Errorf("failed to get config from GCS: %w", err)
 	}
+
 	if err := validateConfig(cfg); err != nil {
 		return fmt.Errorf("got invalid config from path %q: %w", cfgPath, err)
 	}
 	log.V(2).Infof("got config from GCS (%q): %+v\n", cfgPath, cfg)
 
-	if err := notifier.SetUp(ctx, cfg, &actualSecretManager{smc}); err != nil {
+	tmpl, err := parseTemplate(ctx, cfg.Spec.Notification.Template, &actualGCSReaderFactory{sc})
+	if err != nil {
+		return fmt.Errorf("failed to parse template from notiifer spec %q: %w", cfg.Spec.Notification.Template, err)
+	}
+
+	sm := &actualSecretManager{client: smc}
+
+	br, err := newResolver(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to construct a binding resolver: %v", err)
+	}
+
+	if err := notifier.SetUp(ctx, cfg, tmpl, sm, br); err != nil {
 		return fmt.Errorf("failed to call SetUp on notifier: %w", err)
 	}
+
+	_, ignoreBadMessages := GetEnv("IGNORE_BAD_MESSAGES")
 
 	log.V(2).Infoln("starting HTTP server...")
 
 	// Our Pub/Sub push receiver.
-	http.HandleFunc("/", newReceiver(notifier))
+	http.HandleFunc("/", newReceiver(notifier, &receiverParams{ignoreBadMessages}))
 
 	// An auxilliary, healthz-style receiver.
 	// You can call this endpoint using the curl command here:
@@ -242,6 +292,29 @@ func Main(notifier Notifier) error {
 	return http.ListenAndServe(":"+port, nil)
 }
 
+func parseTemplate(ctx context.Context, tmpl *Template, grf gcsReaderFactory) (string, error) {
+	templateString := ""
+	if tmpl != nil {
+		if _, ok := allowedTemplateTypes[tmpl.Type]; !ok {
+			return "", fmt.Errorf("got invalid Template Type: %v", tmpl.Type)
+		}
+		if tmpl.URI != "" {
+			parsed, err := getGCSTemplate(ctx, grf, tmpl.URI)
+			if err != nil {
+				return "", fmt.Errorf("failed to get template from GCS: %w", err)
+			}
+			templateString = parsed
+		} else {
+			templateString = tmpl.Content
+		}
+		if err := validateTemplate(templateString); err != nil {
+			return "", fmt.Errorf("got invalid template from path %q: %w", tmpl.URI, err)
+		}
+	}
+	return templateString, nil
+
+}
+
 type gcsReaderFactory interface {
 	NewReader(ctx context.Context, bucket, object string) (io.ReadCloser, error)
 }
@@ -256,6 +329,7 @@ func (a *actualGCSReaderFactory) NewReader(ctx context.Context, bucket, object s
 
 type actualSecretManager struct {
 	client *secretmanager.Client
+	// TODO(ljr): Do we want any sort of timed cache here?
 }
 
 func (a *actualSecretManager) GetSecret(ctx context.Context, name string) (string, error) {
@@ -277,20 +351,26 @@ func (c *setupCheckSecretGetter) GetSecret(_ context.Context, name string) (stri
 
 // getGCSConfig fetches the YAML Config file from the given GCS path and returns the parsed Config.
 func getGCSConfig(ctx context.Context, grf gcsReaderFactory, path string) (*Config, error) {
-	if trm := strings.TrimPrefix(path, "gs://"); trm != path {
-		// path started with the prefix
-		path = trm
-	} else {
-		return nil, fmt.Errorf("expected %q to start with `gs://`", path)
+	if !gcsConfigPattern.MatchString(path) {
+		return nil, fmt.Errorf("expected path %q to match pattern %v", path, gcsConfigPattern)
 	}
+	// if trm := strings.TrimPrefix(path, "gs://"); trm != path {
+	// 	// path started with the prefix
+	// 	path = trm
+	// } else {
+	// 	return nil, fmt.Errorf("expected %q to start with `gs://`", path)
+	// }
 
-	split := strings.SplitN(path, "/", 2)
-	log.V(2).Infof("got path split: %+v", split)
-	if len(split) != 2 {
+	// split := strings.SplitN(path, "/", 2)
+	// log.V(2).Infof("got path split: %+v", split)
+	// if len(split) != 2 {
+	// 	return nil, fmt.Errorf("path has incorrect format (expected form: `[gs://]bucket/path/to/object`): %q => %s", path, strings.Join(split, ", "))
+	// }
+	split := gcsConfigPattern.FindStringSubmatch(path)
+	if len(split) != 3 {
 		return nil, fmt.Errorf("path has incorrect format (expected form: `[gs://]bucket/path/to/object`): %q => %s", path, strings.Join(split, ", "))
 	}
-
-	bucket, object := split[0], split[1]
+	bucket, object := split[1], split[2]
 	r, err := grf.NewReader(ctx, bucket, object)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get reader for (bucket=%q, object=%q): %w", bucket, object, err)
@@ -305,6 +385,35 @@ func getGCSConfig(ctx context.Context, grf gcsReaderFactory, path string) (*Conf
 	return cfg, nil
 }
 
+// getGCSConfig fetches the Template file from the given GCS path and returns the parsed Config.
+func getGCSTemplate(ctx context.Context, grf gcsReaderFactory, path string) (string, error) {
+	if trm := strings.TrimPrefix(path, "gs://"); trm != path {
+		// path started with the prefix
+		path = trm
+	} else {
+		return "", fmt.Errorf("expected %q to start with `gs://`", path)
+	}
+
+	split := strings.SplitN(path, "/", 2)
+	log.V(2).Infof("got path split: %+v", split)
+	if len(split) != 2 {
+		return "", fmt.Errorf("path has incorrect format (expected form: `[gs://]bucket/path/to/object`): %q => %s", path, strings.Join(split, ", "))
+	}
+
+	bucket, object := split[0], split[1]
+	r, err := grf.NewReader(ctx, bucket, object)
+	if err != nil {
+		return "", fmt.Errorf("failed to get reader for (bucket=%q, object=%q): %w", bucket, object, err)
+	}
+	defer r.Close()
+	tmpl, err := decodeTemplate(r)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse template at %q: %w", path, err)
+	}
+
+	return tmpl, nil
+}
+
 func decodeConfig(r io.Reader) (*Config, error) {
 	cfg := new(Config)
 	dcd := yaml.NewDecoder(r)
@@ -312,14 +421,38 @@ func decodeConfig(r io.Reader) (*Config, error) {
 	return cfg, dcd.Decode(cfg)
 }
 
+func decodeTemplate(r io.Reader) (string, error) {
+	buf := new(bytes.Buffer)
+	_, err := buf.ReadFrom(r)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse template from Template file: %w", err)
+	}
+	return buf.String(), nil
+}
+
 // validateConfig checks the following (or errors):
 // - apiVersion is one of allowedYAMLAPIVersions.
+// - user substitution names match the subNamePattern regexp.
 func validateConfig(cfg *Config) error {
 	if allowed := allowedYAMLAPIVersions[cfg.APIVersion]; !allowed {
 		return fmt.Errorf("expected `apiVersion` %q to be one of the following:\n%v",
 			cfg.APIVersion, allowedYAMLAPIVersions)
 	}
+
+	if cfg.Spec == nil {
+		return errors.New("expected config.spec to be present")
+	}
+
+	if cfg.Spec.Notification == nil {
+		return errors.New("expected config.spec.notification to be present")
+	}
+
 	return nil
+}
+
+func validateTemplate(s string) error {
+	_, err := template.New("").Parse(s)
+	return err
 }
 
 // MakeCELPredicate returns a CELPredicate for the given filter string of CEL code.
@@ -358,15 +491,19 @@ func MakeCELPredicate(filter string) (*CELPredicate, error) {
 func GetEnv(name string) (string, bool) {
 	val := os.Getenv(name)
 	if val == "" {
-		log.Warningf("env var %q is empty", name)
+		log.V(2).Infof("env var %q is empty", name)
 	} else {
 		log.V(2).Infof("env var %q is %q", name, val)
 	}
 	return val, val != ""
 }
 
+type receiverParams struct {
+	ignoreBadMessages bool
+}
+
 // newReceiver returns a Pub/Sub push HTTP receiving http.HandlerFunc that calls the given notifier.
-func newReceiver(notifier Notifier) http.HandlerFunc {
+func newReceiver(notifier Notifier, params *receiverParams) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		var pspw pubSubPushWrapper
@@ -394,7 +531,14 @@ func newReceiver(notifier Notifier) http.HandlerFunc {
 		}
 		bv2 := proto.MessageV2(build)
 		if err := uo.Unmarshal(pspw.Message.Data, bv2); err != nil {
-			log.Errorf("failed to unmarshal PubSub message %q into a Build: %v", pspw.Message.ID, err)
+			if params.ignoreBadMessages {
+				log.Warningf("not attempting to handle unmarshal-able Pub/Sub message id=%q data=%q publishTime=%q which gave error: %v",
+					pspw.Message.ID, string(pspw.Message.Data), pspw.Message.PublishTime, err)
+				return
+			}
+
+			log.Errorf("failed to unmarshal PubSub message id=%q data=%q publishTime=%q into a Build: %v",
+				pspw.Message.ID, string(pspw.Message.Data), pspw.Message.PublishTime, err)
 			http.Error(w, "Bad Cloud Build Pub/Sub data", http.StatusBadRequest)
 			return
 		}
@@ -449,6 +593,8 @@ type UTMMedium string
 const (
 	// EmailMedium is for Build log URLs that are sent via email.
 	EmailMedium UTMMedium = "email"
+	// StorageMedium is for Build log URLS that are sent to a storage medium (i.e. BigQuery).
+	StorageMedium = "storage"
 	// ChatMedium is for Build log URLs that are sent over chat applications.
 	ChatMedium = "chat"
 	// HTTPMedium is for Build log URLs that are sent over HTTP(S) communication (that does not belong to one of the other mediums).
@@ -473,7 +619,7 @@ func AddUTMParams(logURL string, medium UTMMedium) (string, error) {
 
 	var m string
 	switch medium {
-	case EmailMedium, ChatMedium, HTTPMedium, OtherMedium:
+	case EmailMedium, StorageMedium, ChatMedium, HTTPMedium, OtherMedium:
 		m = string(medium)
 	default:
 		return "", fmt.Errorf("unknown UTM medium: %q", medium)

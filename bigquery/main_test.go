@@ -16,9 +16,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -58,28 +60,36 @@ func (ml *fakeLayer) MediaType() (types.MediaType, error) {
 	return "", nil
 }
 
-type mockBQ struct {
+type fakeBQ struct {
+	validSchema bool
+	writtenRows []*bqRow
 }
 
-type mockBQFactory struct {
+type fakeBQFactory struct {
+	fake *fakeBQ
 }
 
-func (bqf *mockBQFactory) Make(ctx context.Context) (bq, error) {
-	return &mockBQ{}, nil
+func (bqf *fakeBQFactory) Make(ctx context.Context) (bq, error) {
+	return bqf.fake, nil
 }
+
+const tableURI = "projects/project_name/datasets/dataset_name/tables/valid"
 
 var fakeBQServerDS = map[string]fakeDMResponse{
-	"dne":     {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: 404, Message: "not found"}},
-	"noauth":  {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: 403, Message: "no authorization"}},
-	"broke":   {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: 500, Message: "bq server error"}},
-	"strange": {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: 305, Message: "use proxy"}},
+	"dne":     {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: http.StatusNotFound, Message: "not found"}},
+	"noauth":  {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: http.StatusForbidden, Message: "no authorization"}},
+	"broke":   {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: http.StatusInternalServerError, Message: "bq server error"}},
+	"strange": {&bigquery.DatasetMetadata{}, &googleapi.Error{Code: http.StatusProxyAuthRequired, Message: "use proxy"}},
 }
 
 var fakeBQServerTable = map[string]fakeTMResponse{
-	"dne":     {&bigquery.TableMetadata{}, &googleapi.Error{Code: 404, Message: "not found"}},
-	"noauth":  {&bigquery.TableMetadata{}, &googleapi.Error{Code: 403, Message: "no authorization"}},
-	"broke":   {&bigquery.TableMetadata{}, &googleapi.Error{Code: 500, Message: "bq server error"}},
-	"strange": {&bigquery.TableMetadata{}, &googleapi.Error{Code: 305, Message: "use proxy"}},
+	"dne":            {&bigquery.TableMetadata{}, &googleapi.Error{Code: http.StatusNotFound, Message: "not found"}},
+	"noauth":         {&bigquery.TableMetadata{}, &googleapi.Error{Code: http.StatusForbidden, Message: "no authorization"}},
+	"broke":          {&bigquery.TableMetadata{}, &googleapi.Error{Code: http.StatusInternalServerError, Message: "bq server error"}},
+	"strange":        {&bigquery.TableMetadata{}, &googleapi.Error{Code: http.StatusProxyAuthRequired, Message: "use proxy"}},
+	"notinitialized": {&bigquery.TableMetadata{Name: "name"}, nil},
+	"empty":          {&bigquery.TableMetadata{Schema: bigquery.Schema{}}, nil},
+	"notempty":       {&bigquery.TableMetadata{Schema: bigquery.Schema{&bigquery.FieldSchema{Name: "field"}}}, nil},
 }
 
 type fakeDMResponse struct {
@@ -92,8 +102,8 @@ type fakeTMResponse struct {
 	fakeError error
 }
 
-func (bq *mockBQ) EnsureDataset(ctx context.Context, datasetName string) error {
-	fakeResponse, _ := fakeBQServerDS[datasetName]
+func (bq *fakeBQ) EnsureDataset(ctx context.Context, datasetName string) error {
+	fakeResponse := fakeBQServerDS[datasetName]
 	err := fakeResponse.fakeError
 	if err != nil {
 		log.Warningf("Error obtaining dataset metadata: %v", err)
@@ -111,8 +121,13 @@ func (bq *mockBQ) EnsureDataset(ctx context.Context, datasetName string) error {
 	return nil
 }
 
-func (bq *mockBQ) EnsureTable(ctx context.Context, tableName string) error {
-	fakeResponse, _ := fakeBQServerTable[tableName]
+func (bq *fakeBQ) EnsureTable(ctx context.Context, tableName string) error {
+	if tableName == "valid" {
+		bq.validSchema = true
+		return nil
+	}
+	bq.validSchema = false
+	fakeResponse := fakeBQServerTable[tableName]
 	err := fakeResponse.fakeError
 	if err != nil {
 		log.Warningf("Error obtaining table metadata: %v", err)
@@ -127,18 +142,24 @@ func (bq *mockBQ) EnsureTable(ctx context.Context, tableName string) error {
 		}
 		return fmt.Errorf("Encountered error %v: ", err.Error())
 	}
-	return nil
-}
-
-func (bq *mockBQ) WriteRow(ctx context.Context, row *bqRow) error {
-	if row == nil {
-		return fmt.Errorf("cannot insert empty row")
+	if len(fakeResponse.table.Schema) == 0 {
+		bq.validSchema = true
 	}
 	return nil
 }
 
+func (bq *fakeBQ) WriteRow(ctx context.Context, row *bqRow) error {
+	if !bq.validSchema {
+		return errors.New("Error writing to table, invalid schema")
+	}
+	if row == nil {
+		return errors.New("cannot insert empty row")
+	}
+	bq.writtenRows = append(bq.writtenRows, row)
+	return nil
+}
+
 func TestSetUp(t *testing.T) {
-	const tableURI = "projects/project_name/datasets/dataset_name/tables/table_name"
 
 	for _, tc := range []struct {
 		name    string
@@ -222,8 +243,8 @@ func TestSetUp(t *testing.T) {
 		wantErr: true,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			n := &bqNotifier{bqf: &mockBQFactory{}}
-			err := n.SetUp(context.Background(), tc.cfg, nil)
+			n := &bqNotifier{bqf: &fakeBQFactory{&fakeBQ{}}}
+			err := n.SetUp(context.Background(), tc.cfg, "", nil, nil)
 			if err != nil {
 				if tc.wantErr {
 					t.Logf("got expected error: %v", err)
@@ -241,6 +262,7 @@ func TestSetUp(t *testing.T) {
 }
 
 func TestEnsureFunctions(t *testing.T) {
+	const tableURI = "projects/project_name/datasets/dataset_name/tables/valid"
 
 	for _, tc := range []struct {
 		name    string
@@ -253,7 +275,7 @@ func TestEnsureFunctions(t *testing.T) {
 				Notification: &notifiers.Notification{
 					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
 					Delivery: map[string]interface{}{
-						"table": "projects/project_name/datasets/dataset_name/tables/table_name",
+						"table": tableURI,
 					},
 				},
 			},
@@ -265,7 +287,7 @@ func TestEnsureFunctions(t *testing.T) {
 				Notification: &notifiers.Notification{
 					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
 					Delivery: map[string]interface{}{
-						"table": "projects/project_name/datasets/dne/tables/table_name",
+						"table": "projects/project_name/datasets/dne/tables/valid",
 					},
 				},
 			},
@@ -289,7 +311,7 @@ func TestEnsureFunctions(t *testing.T) {
 				Notification: &notifiers.Notification{
 					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
 					Delivery: map[string]interface{}{
-						"table": "projects/project_name/datasets/noauth/tables/table_name",
+						"table": "projects/project_name/datasets/noauth/tables/valid",
 					},
 				},
 			},
@@ -342,7 +364,7 @@ func TestEnsureFunctions(t *testing.T) {
 					Notification: &notifiers.Notification{
 						Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
 						Delivery: map[string]interface{}{
-							"table": "projects/project_name/datasets/broke/tables/table_name",
+							"table": "projects/project_name/datasets/broke/tables/valid",
 						},
 					},
 				},
@@ -350,8 +372,8 @@ func TestEnsureFunctions(t *testing.T) {
 			wantErr: true,
 		}} {
 		t.Run(tc.name, func(t *testing.T) {
-			n := &bqNotifier{bqf: &mockBQFactory{}}
-			err := n.SetUp(context.Background(), tc.cfg, nil)
+			n := &bqNotifier{bqf: &fakeBQFactory{&fakeBQ{}}}
+			err := n.SetUp(context.Background(), tc.cfg, "", nil, nil)
 			if err != nil {
 				if tc.wantErr {
 					t.Logf("got expected error: %v", err)
@@ -369,42 +391,70 @@ func TestEnsureFunctions(t *testing.T) {
 }
 
 func TestSendNotification(t *testing.T) {
-	cfg := &notifiers.Config{
-		Spec: &notifiers.Spec{
-			Notification: &notifiers.Notification{
-				Filter: `build.build_trigger_id == "1234" `,
-				Delivery: map[string]interface{}{
-					"table": "projects/project_name/datasets/dataset_name/tables/table_name",
+	const tableURI = "projects/project_name/datasets/dataset_name/tables/valid"
+
+	for _, tc := range []struct {
+		name    string
+		cfg     *notifiers.Config
+		build   *cbpb.Build
+		wantErr bool
+		wantRow bool
+	}{{
+		name: "missing IDs",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "1234" `,
+					Delivery: map[string]interface{}{
+						"table": tableURI,
+					},
 				},
 			},
 		},
-	}
-	for _, tc := range []struct {
-		name    string
-		build   *cbpb.Build
-		wantErr bool
-	}{{
-		name: "mising IDs",
 		build: &cbpb.Build{
 			BuildTriggerId: "1234",
+			Id:             "1",
+			Status:         cbpb.Build_SUCCESS,
 		},
 		wantErr: true,
+		wantRow: false,
 	}, {
 		name: "unknown status",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "1234" `,
+					Delivery: map[string]interface{}{
+						"table": tableURI,
+					},
+				},
+			},
+		},
 		build: &cbpb.Build{
 			ProjectId:      "Project ID",
 			Id:             "Build ID",
 			BuildTriggerId: "1234",
-			Status:         0,
+			Status:         cbpb.Build_STATUS_UNKNOWN,
 		},
-		wantErr: true,
+		wantErr: false,
+		wantRow: false,
 	}, {
 		name: "successful build",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "1234" `,
+					Delivery: map[string]interface{}{
+						"table": tableURI,
+					},
+				},
+			},
+		},
 		build: &cbpb.Build{
 			ProjectId:      "Project ID",
 			Id:             "Build ID",
 			BuildTriggerId: "1234",
-			Status:         3,
+			Status:         cbpb.Build_SUCCESS,
 			CreateTime:     timestamppb.Now(),
 			StartTime:      timestamppb.Now(),
 			FinishTime:     timestamppb.Now(),
@@ -412,21 +462,138 @@ func TestSendNotification(t *testing.T) {
 			Options:        &cbpb.BuildOptions{Env: []string{}},
 		},
 		wantErr: false,
+		wantRow: true,
 	}, {
 		name: "no timestamp build",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "1234" `,
+					Delivery: map[string]interface{}{
+						"table": tableURI,
+					},
+				},
+			},
+		},
 		build: &cbpb.Build{
 			ProjectId:      "Project ID",
 			Id:             "Build ID",
 			BuildTriggerId: "1234",
-			Status:         4,
+			Status:         cbpb.Build_FAILURE,
 		},
 		wantErr: true,
+		wantRow: false,
+	}, {
+		name: "table is empty",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
+					Delivery: map[string]interface{}{
+						"table": "projects/project_name/datasets/dataset_name/tables/empty",
+					},
+				},
+			},
+		},
+		build: &cbpb.Build{
+			ProjectId:      "Project ID",
+			Id:             "Build ID",
+			BuildTriggerId: "123e4567-e89b-12d3-a456-426614174000",
+			Status:         cbpb.Build_SUCCESS,
+			CreateTime:     timestamppb.Now(),
+			StartTime:      timestamppb.Now(),
+			FinishTime:     timestamppb.Now(),
+			Tags:           []string{},
+			Options:        &cbpb.BuildOptions{Env: []string{}},
+		},
+		wantErr: false,
+		wantRow: true,
+	}, {
+		name: "schema not initialized",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
+					Delivery: map[string]interface{}{
+						"table": "projects/project_name/datasets/dataset_name/tables/notinitialized",
+					},
+				},
+			},
+		},
+		build: &cbpb.Build{
+			ProjectId:      "Project ID",
+			Id:             "Build ID",
+			BuildTriggerId: "123e4567-e89b-12d3-a456-426614174000",
+			Status:         cbpb.Build_SUCCESS,
+			CreateTime:     timestamppb.Now(),
+			StartTime:      timestamppb.Now(),
+			FinishTime:     timestamppb.Now(),
+			Tags:           []string{},
+			Options:        &cbpb.BuildOptions{Env: []string{}},
+		},
+		wantErr: false,
+		wantRow: true,
+	}, {
+		name: "no build step timing",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
+					Delivery: map[string]interface{}{
+						"table": "projects/project_name/datasets/dataset_name/tables/notinitialized",
+					},
+				},
+			},
+		},
+		build: &cbpb.Build{
+			ProjectId:      "Project ID",
+			Id:             "Build ID",
+			BuildTriggerId: "123e4567-e89b-12d3-a456-426614174000",
+			Status:         cbpb.Build_SUCCESS,
+			CreateTime:     timestamppb.Now(),
+			StartTime:      timestamppb.Now(),
+			FinishTime:     timestamppb.Now(),
+			Tags:           []string{},
+			Steps:          []*cbpb.BuildStep{{Name: "test"}},
+			Options:        &cbpb.BuildOptions{Env: []string{}},
+		},
+		wantErr: false,
+		wantRow: true,
+	}, {
+		name: "table exists with bad schema",
+		cfg: &notifiers.Config{
+			Spec: &notifiers.Spec{
+				Notification: &notifiers.Notification{
+					Filter: `build.build_trigger_id == "123e4567-e89b-12d3-a456-426614174000" `,
+					Delivery: map[string]interface{}{
+						"table": "projects/project_name/datasets/dataset_name/tables/notempty",
+					},
+				},
+			},
+		},
+		build: &cbpb.Build{
+			ProjectId:      "Project ID",
+			Id:             "Build ID",
+			BuildTriggerId: "123e4567-e89b-12d3-a456-426614174000",
+			Status:         cbpb.Build_SUCCESS,
+			CreateTime:     timestamppb.Now(),
+			StartTime:      timestamppb.Now(),
+			FinishTime:     timestamppb.Now(),
+			Tags:           []string{},
+			Options:        &cbpb.BuildOptions{Env: []string{}},
+			Steps: []*cbpb.BuildStep{
+				{Status: cbpb.Build_SUCCESS},
+			},
+		},
+		wantErr: true,
+		wantRow: false,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			n := &bqNotifier{bqf: &mockBQFactory{}}
-			err := n.SetUp(context.Background(), cfg, nil)
+			fakeBQ := &fakeBQ{}
+			n := &bqNotifier{bqf: &fakeBQFactory{fakeBQ}}
+			err := n.SetUp(context.Background(), tc.cfg, "{{.Build.Status}}", nil, nil)
 			if err != nil {
-				t.Fatalf("Setup(%v) got unexpected error: %v", cfg, err)
+				t.Fatalf("Setup(%v) got unexpected error: %v", tc.cfg, err)
 			}
 			err = n.SendNotification(context.Background(), tc.build)
 			if err != nil {
@@ -439,7 +606,12 @@ func TestSendNotification(t *testing.T) {
 			if tc.wantErr {
 				t.Error("unexpected success")
 			}
-
+			if !tc.wantRow && len(fakeBQ.writtenRows) != 0 {
+				t.Errorf("unexpected write: %v", fakeBQ.writtenRows)
+			}
+			if tc.wantRow && len(fakeBQ.writtenRows) == 0 {
+				t.Error("expected write")
+			}
 		})
 	}
 }
@@ -494,5 +666,11 @@ func TestGetImageSize(t *testing.T) {
 				t.Error("unexpected success")
 			}
 		})
+	}
+}
+
+func TestInferSchema(t *testing.T) {
+	if _, err := bigquery.InferSchema(bqRow{}); err != nil {
+		t.Errorf("Failed to infer schema: %v", err)
 	}
 }

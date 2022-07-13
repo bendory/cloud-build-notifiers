@@ -29,12 +29,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	cbpb "google.golang.org/genproto/googleapis/devtools/cloudbuild/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func convertToTimestamp(t *testing.T, datetime string) *timestamppb.Timestamp {
+	timestamp, err := time.Parse(time.RFC3339, datetime)
+	if err != nil {
+		t.Fatalf("Failed to parse datetime string: %v", err)
+	}
+	ppbtimestamp, err := ptypes.TimestampProto(timestamp)
+	if err != nil {
+		t.Fatalf("Failed to parse timestamp: %v", err)
+	}
+	return ppbtimestamp
+}
 
 func TestMakeCELPredicate(t *testing.T) {
 	ctx := context.Background()
@@ -56,7 +72,7 @@ func TestMakeCELPredicate(t *testing.T) {
 			wantMatch: false,
 		}, {
 			name:      "status match",
-			filter:    "build.status ==Build.Status.SUCCESS",
+			filter:    "build.status == Build.Status.SUCCESS",
 			build:     &cbpb.Build{Id: "xyz", Status: cbpb.Build_SUCCESS},
 			wantMatch: true,
 		}, {
@@ -101,9 +117,73 @@ func TestMakeCELPredicate(t *testing.T) {
 			wantMatch: true,
 		}, {
 			name:      "substitutions mismatch",
-			filter:    `build.substitutions["DINNER"] == "PIZZA"`,
+			filter:    `"DINNER" in build.substitutions && build.substitutions["DINNER"] == "PIZZA"`,
 			build:     &cbpb.Build{Substitutions: map[string]string{"DESSERT": "CANNOLI"}},
 			wantMatch: false,
+		}, {
+			name:      "before timestamp",
+			filter:    `timestamp("2020-01-01T10:00:20.021-05:00") <= build.start_time`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-01-01T10:00:20.021-05:00")},
+			wantMatch: false,
+		},
+		{
+			name:      "after timestamp",
+			filter:    `timestamp("1972-01-01T10:00:20.021-05:00") < build.start_time`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-01-01T10:00:20.000-05:00")},
+			wantMatch: true,
+		},
+		{
+			name:      "before integer year",
+			filter:    `timestamp("2019-01-01T10:00:20.000-05:00") > build.start_time`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2018-01-01T10:00:20.000-05:00")},
+			wantMatch: true,
+		},
+		{
+			name:      "after integer year",
+			filter:    `timestamp("2019-01-01T10:00:20.000-05:00") < build.start_time`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2020-01-01T10:00:20.000-05:00")},
+			wantMatch: true,
+		},
+		{
+			name:      "specific day match",
+			filter:    `timestamp("2019-07-24T00:00:00.000-05:00") <= build.start_time && build.start_time < timestamp("2019-07-25T00:00:00.000-05:00")`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-07-24T12:00:00.000-00:00")},
+			wantMatch: true,
+		},
+		{
+			name:      "not specific day match",
+			filter:    `timestamp("2020-07-24T00:00:00.000-00:00") <= build.start_time && build.start_time < timestamp("2020-07-25T00:00:00.000-00:00")`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-07-23T00:00:00.000-05:00")},
+			wantMatch: false,
+		},
+		{
+			name:      "first of the month",
+			filter:    `build.start_time.getDayOfMonth() == 0`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-07-02T00:00:00.000-00:00")},
+			wantMatch: false,
+		},
+		{
+			name:      "first of the month match",
+			filter:    `build.start_time.getDayOfMonth()==0`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-07-01T12:00:00.000-00:00")},
+			wantMatch: true,
+		},
+		{
+			name:      "build at least five minutes",
+			filter:    `build.finish_time - build.start_time >= duration("300s")`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-07-01T12:00:00.000-00:00"), FinishTime: convertToTimestamp(t, "2019-07-01T12:10:00.000-00:00")},
+			wantMatch: true,
+		},
+		{
+			name:      "build shorter than five minutes",
+			filter:    `build.finish_time - build.start_time < duration("300s")`,
+			build:     &cbpb.Build{StartTime: convertToTimestamp(t, "2019-07-01T12:00:00.000-00:00"), FinishTime: convertToTimestamp(t, "2019-07-01T12:00:03.000-00:00")},
+			wantMatch: true,
+		}, {
+			name:      "complex filter with regexp via `matches`",
+			filter:    `build.status in [Build.Status.FAILURE, Build.Status.TIMEOUT] && build.substitutions["TAG_NAME"].matches("^v\\d{1}\\.\\d{1}\\.\\d{3}$")`,
+			build:     &cbpb.Build{Status: cbpb.Build_TIMEOUT, Substitutions: map[string]string{"TAG_NAME": "v1.2.003"}},
+			wantMatch: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,7 +240,9 @@ func (f *fakeGCSReaderFactory) NewReader(_ context.Context, bucket, object strin
 	return ioutil.NopCloser(bytes.NewBufferString(s)), nil
 }
 
-const validConfigYAML = `
+// It's annoying to update this config since YAML requires spaces but Go likes tabs.
+// Just keep everything at tabs and then replace accordingly.
+const validConfigYAMLWithTabs = `
 apiVersion: cloud-build-notifiers/v1
 kind: TestNotifier
 metadata:
@@ -171,8 +253,15 @@ spec:
     delivery:
       some_key: some_value
       other_key: [404, 505]
-      third_key:
-        foo: bar
+	  third_key:
+		foo: bar
+	template:
+		type: golang
+		uri: gs://bucket/path/to/some/template
+		content: "{{.Build.Status}}"
+    params:
+      _SOME_SUBST: $(build['_SOME_SUBST'])
+      _SOME_SECRET: $(secrets['some-secret'])
   secrets:
     - name: some-secret
       value: projects/my-project/secrets/my-secret/versions/latest
@@ -192,6 +281,15 @@ var validConfig = &Config{
 				"other_key": []interface{}{int(404), int(505)},
 				"third_key": map[interface{}]interface{}{string("foo"): string("bar")},
 			},
+			Template: &Template{
+				Type:    "golang",
+				URI:     "gs://bucket/path/to/some/template",
+				Content: "{{.Build.Status}}",
+			},
+			Params: map[string]string{
+				"_SOME_SUBST":  "$(build['_SOME_SUBST'])",
+				"_SOME_SECRET": "$(secrets['some-secret'])",
+			},
 		},
 		Secrets: []*Secret{{
 			LocalName:    "some-secret",
@@ -200,13 +298,14 @@ var validConfig = &Config{
 	},
 }
 
-var validFakeFactory = &fakeGCSReaderFactory{
-	data: map[string]string{
-		"gs://path/to/my/config.yaml": validConfigYAML,
-	},
-}
-
 func TestGetGCSConfig(t *testing.T) {
+	validYAML := strings.ReplaceAll(validConfigYAMLWithTabs, "\t", "    " /* 4 spaces */)
+	validFakeFactory := &fakeGCSReaderFactory{
+		data: map[string]string{
+			"gs://path/to/my/config.yaml": validYAML,
+		},
+	}
+
 	for _, tc := range []struct {
 		name       string
 		path       string
@@ -251,6 +350,69 @@ func TestGetGCSConfig(t *testing.T) {
 
 			if diff := cmp.Diff(tc.wantConfig, gotConfig); diff != "" {
 				t.Fatalf("getGCSConfig(%q) produced unexpected Config diff: (want- got+)\n%s", tc.path, diff)
+			}
+		})
+	}
+}
+
+func TestGetGCSTemplate(t *testing.T) {
+	validTemplate := `
+		SomeTemplate {{.buildStatus}}
+	`
+	validFakeFactory := &fakeGCSReaderFactory{
+		data: map[string]string{
+			"gs://path/to/my/template": validTemplate,
+		},
+	}
+
+	for _, tc := range []struct {
+		name         string
+		path         string
+		fake         *fakeGCSReaderFactory
+		wantError    bool
+		wantTemplate string
+	}{
+		{
+			name:         "valid and present template",
+			path:         "gs://path/to/my/template",
+			fake:         validFakeFactory,
+			wantTemplate: validTemplate,
+		}, {
+			name:      "bad path",
+			path:      "gs://path/to/nowhere",
+			fake:      validFakeFactory,
+			wantError: true,
+		}, {
+			name: "bad template",
+			path: "gs://path/to/my/template",
+			fake: &fakeGCSReaderFactory{
+				data: map[string]string{
+					"gs://path/to/my/config.yaml": `blahBADdata {{}}`,
+				},
+			},
+			wantError: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTemplate, err := getGCSTemplate(context.Background(), tc.fake, tc.path)
+			if err != nil {
+				if tc.wantError {
+					t.Logf("got expected error: %v", err)
+					return
+				}
+				t.Fatalf("getGCSTemplate(%q) failed: %v", tc.path, err)
+			}
+			if validateTemplate(gotTemplate) != nil && tc.wantError {
+				t.Logf("got expected error: %v", err)
+				return
+			}
+
+			if tc.wantError {
+				t.Fatalf("getGCSTemplate(%q) succeeded unexpectedly: %v", tc.path, err)
+			}
+
+			if diff := cmp.Diff(tc.wantTemplate, gotTemplate); diff != "" {
+				t.Fatalf("getGCSTemplate(%q) produced unexpected template diff: (want- got+)\n%s", tc.path, diff)
 			}
 		})
 	}
@@ -429,14 +591,6 @@ func TestAddUTMParamsErrors(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	// Config setup.
-	var badAPIVersion Config
-	badAPIVersion = *validConfig
-	badAPIVersion.APIVersion = "something-not-correct"
-	if badAPIVersion == *validConfig {
-		t.Fatal("sanity check failed")
-	}
-
 	for _, tc := range []struct {
 		name    string
 		cfg     *Config
@@ -446,8 +600,24 @@ func TestValidateConfig(t *testing.T) {
 			name: "valid config",
 			cfg:  validConfig,
 		}, {
-			name:    "bad `apiVersion`",
-			cfg:     &badAPIVersion,
+			name: "bad `apiVersion`",
+			cfg: &Config{
+				APIVersion: "some-bad-api-version",
+				Spec:       &Spec{Notification: &Notification{}},
+			},
+			wantErr: true,
+		}, {
+			name: "no spec",
+			cfg: &Config{
+				APIVersion: "cloud-build-notifiers/v1",
+			},
+			wantErr: true,
+		}, {
+			name: "no spec.notification",
+			cfg: &Config{
+				APIVersion: "cloud-build-notifiers/v1",
+				Spec:       &Spec{},
+			},
 			wantErr: true,
 		},
 	} {
@@ -473,7 +643,7 @@ type fakeNotifier struct {
 	notifs chan *cbpb.Build
 }
 
-func (f *fakeNotifier) SetUp(_ context.Context, _ *Config, _ SecretGetter) error {
+func (f *fakeNotifier) SetUp(_ context.Context, _ *Config, _ string, _ SecretGetter, _ BindingResolver) error {
 	// Not currently called by any test.
 	return nil
 }
@@ -512,7 +682,7 @@ func TestNewReceiver(t *testing.T) {
 	bc := make(chan *cbpb.Build, 1)
 	fn := &fakeNotifier{notifs: bc}
 
-	handler := newReceiver(fn)
+	handler := newReceiver(fn, &receiverParams{})
 	req := httptest.NewRequest(http.MethodPost, "http://notifer.example.com/", bytes.NewBuffer(j))
 	w := httptest.NewRecorder()
 
@@ -530,17 +700,16 @@ func TestNewReceiver(t *testing.T) {
 		t.Fatal("failed to received a Build from the notifier before the timeout")
 	}
 
-	if diff := cmp.Diff(sentBuild, gotBuild); diff != "" {
+	if diff := cmp.Diff(sentBuild, gotBuild, protocmp.Transform()); diff != "" {
 		t.Errorf("unexpected difference between published Build and received Build:\n%s", diff)
 	}
-
 }
 
 type errNotifier struct {
 	err error
 }
 
-func (n *errNotifier) SetUp(_ context.Context, _ *Config, _ SecretGetter) error {
+func (n *errNotifier) SetUp(_ context.Context, _ *Config, _ string, _ SecretGetter, _ BindingResolver) error {
 	return nil
 }
 func (n *errNotifier) SendNotification(_ context.Context, _ *cbpb.Build) error {
@@ -597,7 +766,7 @@ func TestNewReceiverError(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := newReceiver(&errNotifier{tc.sendErr})
+			handler := newReceiver(&errNotifier{tc.sendErr}, &receiverParams{})
 
 			req := httptest.NewRequest(http.MethodPost, "http://notifer.example.com/", tc.body)
 			w := httptest.NewRecorder()
@@ -609,4 +778,112 @@ func TestNewReceiverError(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fatalNotifier struct {
+	t *testing.T
+}
+
+func (n *fatalNotifier) SetUp(_ context.Context, _ *Config, _ string, _ SecretGetter, _ BindingResolver) error {
+	return nil
+}
+func (n *fatalNotifier) SendNotification(_ context.Context, b *cbpb.Build) error {
+	n.t.Helper()
+	n.t.Fatalf("should not have been called; was called with build: %v", b)
+	return nil
+}
+
+func TestReceiverWithIgnoredBadMessage(t *testing.T) {
+	const projectID = "some-project-id"
+	pspw := &pubSubPushWrapper{
+		Message:      pubSubPushMessage{Data: []byte("#bA4Fx"), ID: "id-do-not-care"},
+		Subscription: "subscriber-do-not-care",
+	}
+
+	j, err := json.Marshal(pspw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := newReceiver(&fatalNotifier{t}, &receiverParams{ignoreBadMessages: true})
+	req := httptest.NewRequest(http.MethodPost, "http://notifer.example.com/", bytes.NewBuffer(j))
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+	if s := w.Result().StatusCode; s != http.StatusOK {
+		t.Errorf("result.StatusCode = %d, expected %d", s, http.StatusOK)
+	}
+}
+
+func TestParseTemplate(t *testing.T) {
+	ctx := context.Background()
+	validFakeFactory := &fakeGCSReaderFactory{
+		data: map[string]string{
+			"gs://path/to/my/template.yaml": "{{.Build.Status}}",
+		},
+	}
+	for _, tc := range []struct {
+		name    string
+		tmpl    *Template
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "valid uri",
+			tmpl: &Template{
+				Type: "golang",
+				URI:  "gs://path/to/my/template.yaml",
+			},
+			want: "{{.Build.Status}}",
+		}, {
+			name: "valid content",
+			tmpl: &Template{
+				Type:    "golang",
+				Content: "{{.Build.Status}}",
+			},
+			want: "{{.Build.Status}}",
+		}, {
+			name: "invalid URI",
+			tmpl: &Template{
+				Type: "golang",
+				URI:  "gs://path/to/my/wrong.yaml",
+			},
+			wantErr: true,
+		}, {
+			name: "invalid template",
+			tmpl: &Template{
+				Type:    "golang",
+				Content: "{{something}",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid type",
+			tmpl: &Template{
+				Type: "mustache",
+				URI:  "gs://path/to/my/template.yaml",
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseTemplate(ctx, tc.tmpl, validFakeFactory)
+			if err != nil {
+				if !tc.wantErr {
+					t.Fatalf("parseTemplate(%v) got unexpected error: %v", tc.tmpl, err)
+				} else {
+					t.Logf("got expected error: %v", err)
+					return
+				}
+			}
+			if got != tc.want {
+				t.Fatalf("parseTemplate(%v)=%v, want: %v", tc.tmpl, got, tc.want)
+			}
+
+			if tc.wantErr {
+				t.Fatalf("validateConfig(%v) unexpectedly succeeded", tc.tmpl)
+			}
+		})
+	}
+
 }

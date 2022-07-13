@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: cloud-build-notifiers/v1
-kind: HTTPNotifier
-metadata:
-  name: example-http-notifier
-spec:
-  notification:
-    filter: build.status == Build.Status.SUCCESS
-    template:
-      type: golang
-      uri: gs://project-name/http.json
-    delivery:
-      # The `http(s)://` protocol prefix is required.
-      url: https://some-endpoint
+# [START cloudbuild_samples_failure]
+steps:
+  - name: busybox
+    args: ["false"]
+# [END cloudbuild_samples_failure]
