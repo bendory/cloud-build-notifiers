@@ -19,11 +19,12 @@ import (
 	"context"
 	"fmt"
 	"text/template"
+	"strings"
 
+	cbpb "cloud.google.com/go/cloudbuild/apiv1/v2/cloudbuildpb"
 	"github.com/GoogleCloudPlatform/cloud-build-notifiers/lib/notifiers"
 	log "github.com/golang/glog"
 	"github.com/slack-go/slack"
-	cbpb "google.golang.org/genproto/googleapis/devtools/cloudbuild/v1"
 )
 
 const (
@@ -64,7 +65,12 @@ func (s *slackNotifier) SetUp(ctx context.Context, cfg *notifiers.Config, blockK
 		return fmt.Errorf("failed to get token secret: %w", err)
 	}
 	s.webhookURL = wu
-	tmpl, err := template.New("blockkit_template").Parse(blockKitTemplate)
+	tmpl, err := template.New("blockkit_template").Funcs(template.FuncMap{
+		"replace": func(s, old, new string) string {
+			return strings.ReplaceAll(s, old, new)
+		},
+	}).Parse(blockKitTemplate)
+
 	s.tmpl = tmpl
 	s.br = br
 
@@ -105,14 +111,15 @@ func (s *slackNotifier) writeMessage() (*slack.WebhookMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to add UTM params: %w", err)
 	}
+
 	var clr string
 	switch build.Status {
 	case cbpb.Build_SUCCESS:
-		clr = "good"
+		clr = "#22bb33"
 	case cbpb.Build_FAILURE, cbpb.Build_INTERNAL_ERROR, cbpb.Build_TIMEOUT:
-		clr = "danger"
+		clr = "#bb2124"
 	default:
-		clr = "warning"
+		clr = "#f0ad4e"
 	}
 
 	var buf bytes.Buffer
@@ -126,5 +133,5 @@ func (s *slackNotifier) writeMessage() (*slack.WebhookMessage, error) {
 		return nil, fmt.Errorf("failed to unmarshal templating JSON: %w", err)
 	}
 
-	return &slack.WebhookMessage{Attachments: []slack.Attachment{{Color: clr}}, Blocks: &blocks}, nil
+	return &slack.WebhookMessage{Attachments: []slack.Attachment{{Color: clr, Blocks: blocks}}}, nil
 }

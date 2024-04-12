@@ -31,15 +31,17 @@ import (
 	"strings"
 	"time"
 
+	cbpb "cloud.google.com/go/cloudbuild/apiv1/v2/cloudbuildpb"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	smpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"cloud.google.com/go/storage"
 	log "github.com/golang/glog"
-	"github.com/golang/protobuf/proto"
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker/decls"
-	smpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
-	cbpb "google.golang.org/genproto/googleapis/devtools/cloudbuild/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
 	"gopkg.in/yaml.v2"
 )
 
@@ -67,7 +69,7 @@ var (
 )
 
 var (
-	gcsConfigPattern = regexp.MustCompile(`^gs://([[\w-]+)/([^\\]+$)`)
+	gcsConfigPattern = regexp.MustCompile(`^gs://([[\w-_.]+)/([^\\]+$)`)
 )
 
 // Config is the common type for (YAML-based) configuration files for notifications.
@@ -451,7 +453,12 @@ func validateConfig(cfg *Config) error {
 }
 
 func validateTemplate(s string) error {
-	_, err := template.New("").Parse(s)
+	_, err := template.New("").Funcs(template.FuncMap{
+		"replace": func(s, old, new string) string {
+			return strings.ReplaceAll(s, old, new)
+		},
+	}).Parse(s)
+
 	return err
 }
 
@@ -529,7 +536,7 @@ func newReceiver(notifier Notifier, params *receiverParams) http.HandlerFunc {
 			AllowPartial:   true,
 			DiscardUnknown: true,
 		}
-		bv2 := proto.MessageV2(build)
+		bv2 := protoadapt.MessageV2Of(build)
 		if err := uo.Unmarshal(pspw.Message.Data, bv2); err != nil {
 			if params.ignoreBadMessages {
 				log.Warningf("not attempting to handle unmarshal-able Pub/Sub message id=%q data=%q publishTime=%q which gave error: %v",
@@ -542,16 +549,16 @@ func newReceiver(notifier Notifier, params *receiverParams) http.HandlerFunc {
 			http.Error(w, "Bad Cloud Build Pub/Sub data", http.StatusBadRequest)
 			return
 		}
-		build = proto.MessageV1(bv2).(*cbpb.Build)
+		build = protoadapt.MessageV1Of(bv2).(*cbpb.Build)
 
-		log.V(2).Infof("got PubSub Build payload:\n%+v\nattempting to send notification", proto.MarshalTextString(build))
+		log.V(2).Infof("got PubSub Build payload:\n%+v\nattempting to send notification", prototext.Format(build))
 		if err := notifier.SendNotification(ctx, build); err != nil {
 			log.Errorf("failed to run SendNotification: %v", err)
 			http.Error(w, "failed to send notification", http.StatusInternalServerError)
 			return
 		}
 
-		log.V(2).Infof("acking PubSub message %q with Build payload:\n%v", pspw.Message.ID, proto.MarshalTextString(build))
+		log.V(2).Infof("acking PubSub message %q with Build payload:\n%v", pspw.Message.ID, prototext.Format(build))
 	}
 }
 

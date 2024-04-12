@@ -23,9 +23,13 @@ import (
 	"strings"
 	"text/template"
 
+	cbpb "cloud.google.com/go/cloudbuild/apiv1/v2/cloudbuildpb"
 	"github.com/GoogleCloudPlatform/cloud-build-notifiers/lib/notifiers"
 	log "github.com/golang/glog"
-	cbpb "google.golang.org/genproto/googleapis/devtools/cloudbuild/v1"
+)
+
+const (
+	urlSecretName = "urlRef"
 )
 
 func main() {
@@ -42,7 +46,7 @@ type httpNotifier struct {
 	tmplView *notifiers.TemplateView
 }
 
-func (h *httpNotifier) SetUp(_ context.Context, cfg *notifiers.Config, httpTemplate string, _ notifiers.SecretGetter, br notifiers.BindingResolver) error {
+func (h *httpNotifier) SetUp(ctx context.Context, cfg *notifiers.Config, httpTemplate string, sg notifiers.SecretGetter, br notifiers.BindingResolver) error {
 	prd, err := notifiers.MakeCELPredicate(cfg.Spec.Notification.Filter)
 	if err != nil {
 		return fmt.Errorf("failed to create CELPredicate: %w", err)
@@ -50,11 +54,24 @@ func (h *httpNotifier) SetUp(_ context.Context, cfg *notifiers.Config, httpTempl
 	h.filter = prd
 	h.br = br
 
-	url, ok := cfg.Spec.Notification.Delivery["url"].(string)
-	if !ok {
-		return fmt.Errorf("expected delivery config %v to have string field `url`", cfg.Spec.Notification.Delivery)
+	if url, ok := cfg.Spec.Notification.Delivery["url"].(string); ok {
+		h.url = url
+	} else {
+		uRef, err := notifiers.GetSecretRef(cfg.Spec.Notification.Delivery, urlSecretName)
+		if err != nil {
+			return fmt.Errorf("failed to get Secret ref from delivery config (%v) field %q: %w", cfg.Spec.Notification.Delivery, urlSecretName, err)
+		}
+		uResource, err := notifiers.FindSecretResourceName(cfg.Spec.Secrets, uRef)
+		if err != nil {
+			return fmt.Errorf("failed to find Secret for ref %q: %w", uRef, err)
+		}
+		url, err := sg.GetSecret(ctx, uResource)
+		if err != nil {
+			return fmt.Errorf("failed to get token secret: %w", err)
+		}
+		h.url = url
 	}
-	h.url = url
+
 	tmpl, err := template.New("http_template").Parse(httpTemplate)
 	if err != nil {
 		return fmt.Errorf("failed to parse template: %v", err)

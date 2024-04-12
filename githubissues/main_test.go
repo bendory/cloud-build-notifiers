@@ -1,4 +1,4 @@
-// Copyright 2020 Google LLC
+// Copyright 2022 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,43 +15,92 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"strings"
 	"testing"
+	"text/template"
 
+	cbpb "cloud.google.com/go/cloudbuild/apiv1/v2/cloudbuildpb"
 	"github.com/GoogleCloudPlatform/cloud-build-notifiers/lib/notifiers"
 )
 
-func TestSetUp(t *testing.T) {
-	const url = "https://some.example.com/notify"
+const githubToken = "ghtABC="
+
+type fakeSecretGetter struct{}
+
+func (f *fakeSecretGetter) GetSecret(_ context.Context, _ string) (string, error) {
+	return githubToken, nil
+}
+
+const issuePayload = `
+{
+    "title": "Cloud Build [{{.Build.ProjectId}}]: {{.Build.Status}}",
+    "body": "Cloud Build {{.Build.ProjectId}} {{.Build.BuildTriggerId}} status: **{{.Build.Status}}**\n\n[View Logs]({{.Build.LogUrl}})"
+}`
+
+func TestDefaultIssueTempate(t *testing.T) {
+
+	tmpl, err := template.New("issue_template").Parse(issuePayload)
+	if err != nil {
+		t.Fatalf("template.Parse failed: %v", err)
+	}
+	build := &cbpb.Build{
+		ProjectId: "my-project-id",
+		Id:        "some-build-id",
+		Status:    cbpb.Build_SUCCESS,
+		LogUrl:    "https://some.example.com/log/url?foo=bar",
+	}
+
+	view := &notifiers.TemplateView{
+		Build: &notifiers.BuildView{
+			Build: build,
+		},
+		Params: map[string]string{"buildStatus": "SUCCESS"},
+	}
+
+	body := new(bytes.Buffer)
+	if err := tmpl.Execute(body, view); err != nil {
+		t.Fatalf("failed to execute template: %v", err)
+	}
+
+	if !strings.Contains(body.String(), `SUCCESS`) {
+		t.Error("missing status")
+	}
+
+}
+
+func TestConfigs(t *testing.T) {
+	const repo = "somename/somerepo"
+	goodDelivery := map[string]interface{}{
+		"githubToken": map[interface{}]interface{}{"secretRef": "mytoken"},
+		"githubRepo":  repo,
+	}
+	goodSecret := []*notifiers.Secret{{LocalName: "mytoken", ResourceName: "mysekrit"}}
 
 	for _, tc := range []struct {
 		name    string
 		cfg     *notifiers.Config
-		wantUrl string
 		wantErr bool
 	}{{
 		name: "valid config",
 		cfg: &notifiers.Config{
 			Spec: &notifiers.Spec{
 				Notification: &notifiers.Notification{
-					Filter: `build.status == Build.Status.SUCCESS`,
-					Delivery: map[string]interface{}{
-						"url": url,
-					},
+					Filter:   `build.status == Build.Status.SUCCESS`,
+					Delivery: goodDelivery,
 				},
+				Secrets: goodSecret,
 			},
 		},
-		wantUrl: url,
 	}, {
 		name: "missing filter",
 		cfg: &notifiers.Config{
 			Spec: &notifiers.Spec{
 				Notification: &notifiers.Notification{
-					Delivery: map[string]interface{}{
-						"url": url,
-					},
+					Delivery: goodDelivery,
 				},
+				Secrets: goodSecret,
 			},
 		},
 		wantErr: true,
@@ -60,77 +109,43 @@ func TestSetUp(t *testing.T) {
 		cfg: &notifiers.Config{
 			Spec: &notifiers.Spec{
 				Notification: &notifiers.Notification{
-					Filter: "blah-#B A D#-",
-					Delivery: map[string]interface{}{
-						"url": url,
-					},
+					Filter:   "blah-#B A D#-",
+					Delivery: goodDelivery,
 				},
+				Secrets: goodSecret,
 			},
 		},
 		wantErr: true,
 	}, {
-		name: "missing delivery url",
+		name: "missing delivery repo",
 		cfg: &notifiers.Config{
 			Spec: &notifiers.Spec{
 				Notification: &notifiers.Notification{
 					Filter: `build.status == Build.Status.SUCCESS`,
 					Delivery: map[string]interface{}{
-						"foo": "bar",
+						"githubToken": map[interface{}]interface{}{"secretRef": "mytoken"},
 					},
 				},
+				Secrets: goodSecret,
 			},
 		},
 		wantErr: true,
 	}, {
-		name: "non-string `url`",
+		name: "missing secret",
 		cfg: &notifiers.Config{
 			Spec: &notifiers.Spec{
 				Notification: &notifiers.Notification{
 					Filter: `build.status == Build.Status.SUCCESS`,
 					Delivery: map[string]interface{}{
-						"url": 404,
+						"githubRepo": repo,
 					},
 				},
-			},
-		},
-		wantErr: true,
-	}, {
-		name: "url secret ref",
-		cfg: &notifiers.Config{
-			Spec: &notifiers.Spec{
-				Notification: &notifiers.Notification{
-					Filter: `build.status == Build.Status.SUCCESS`,
-					Delivery: map[string]interface{}{
-						"urlRef": map[interface{}]interface{}{"secretRef": "secretToken"},
-					},
-				},
-				Secrets: []*notifiers.Secret{{
-					LocalName:    "secretToken",
-					ResourceName: urlSecretResource,
-				}},
-			},
-		},
-		wantUrl: urlSecret,
-	}, {
-		name: "incorrect secret reasource",
-		cfg: &notifiers.Config{
-			Spec: &notifiers.Spec{
-				Notification: &notifiers.Notification{
-					Filter: `build.status == Build.Status.SUCCESS`,
-					Delivery: map[string]interface{}{
-						"urlRef": map[interface{}]interface{}{"secretRef": "secretToken"},
-					},
-				},
-				Secrets: []*notifiers.Secret{{
-					LocalName:    "secretToken",
-					ResourceName: "bad-resource",
-				}},
 			},
 		},
 		wantErr: true,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			n := new(httpNotifier)
+			n := new(githubissuesNotifier)
 			err := n.SetUp(context.Background(), tc.cfg, "", new(fakeSecretGetter), nil)
 			if err != nil {
 				if tc.wantErr {
@@ -143,22 +158,6 @@ func TestSetUp(t *testing.T) {
 			if tc.wantErr {
 				t.Error("unexpected success")
 			}
-
-			if !tc.wantErr && n.url != tc.wantUrl {
-				t.Errorf("mismatch in post-setup URL: got %q; want %q", n.url, tc.wantUrl)
-			}
 		})
 	}
-}
-
-const urlSecretResource = "projects/test-project/secrets/test-secret/versions/latest"
-const urlSecret = "http://example.com/?secret"
-
-type fakeSecretGetter struct{}
-
-func (f *fakeSecretGetter) GetSecret(_ context.Context, name string) (string, error) {
-	if name != urlSecretResource {
-		return "", fmt.Errorf("Unexpected secret %s", name)
-	}
-	return urlSecret, nil
 }

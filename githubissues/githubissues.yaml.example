@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2022 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,21 +13,19 @@
 # limitations under the License.
 
 apiVersion: cloud-build-notifiers/v1
-kind: SlackNotifier
+kind: GitHubIssuesNotifier
 metadata:
-  name: example-slack-notifier
+  name: example-githubissues-notifier
 spec:
   notification:
-    filter: build.status == Build.Status.SUCCESS
-    params: 
-      buildStatus: $(build.status)
-    delivery:
-      webhookUrl:
-        secretRef: webhook-url
-    template:
+    filter: build.status == Build.Status.FAILURE
+    template: 
       type: golang
-      uri: gs://example-gcs-bucket/slack.json
-      
+      uri: gs://project-name/githubissues.json
+    delivery:
+      githubToken:
+        secretRef: github-token
+      githubRepo: myuser/myrepo
   secrets:
-  - name: webhook-url
-    value: projects/example-project/secrets/example-slack-notifier-webhook-url/versions/latest
+  - name: github-token
+    value: projects/example-project/secrets/example-github-token/versions/latest

@@ -29,13 +29,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/protobuf/protoadapt"
 
-	"github.com/golang/protobuf/proto"
+	cbpb "cloud.google.com/go/cloudbuild/apiv1/v2/cloudbuildpb"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	cbpb "google.golang.org/genproto/googleapis/devtools/cloudbuild/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -45,10 +45,7 @@ func convertToTimestamp(t *testing.T, datetime string) *timestamppb.Timestamp {
 	if err != nil {
 		t.Fatalf("Failed to parse datetime string: %v", err)
 	}
-	ppbtimestamp, err := ptypes.TimestampProto(timestamp)
-	if err != nil {
-		t.Fatalf("Failed to parse timestamp: %v", err)
-	}
+	ppbtimestamp := timestamppb.New(timestamp)
 	return ppbtimestamp
 }
 
@@ -302,7 +299,10 @@ func TestGetGCSConfig(t *testing.T) {
 	validYAML := strings.ReplaceAll(validConfigYAMLWithTabs, "\t", "    " /* 4 spaces */)
 	validFakeFactory := &fakeGCSReaderFactory{
 		data: map[string]string{
-			"gs://path/to/my/config.yaml": validYAML,
+			"gs://path/to/my/config.yaml":                 validYAML,
+			"gs://bucket-with-dash/dir/config.yaml":       validYAML,
+			"gs://bucket.with.dot/dir/config.yaml":        validYAML,
+			"gs://bucket_with_underscore/dir/config.yaml": validYAML,
 		},
 	}
 
@@ -319,6 +319,22 @@ func TestGetGCSConfig(t *testing.T) {
 			fake:       validFakeFactory,
 			wantConfig: validConfig,
 		}, {
+			name:       "valid and present config in bucket with dashes",
+			path:       "gs://bucket-with-dash/dir/config.yaml",
+			fake:       validFakeFactory,
+			wantConfig: validConfig,
+		}, {
+			name:       "valid and present config in bucket with dots",
+			path:       "gs://bucket.with.dot/dir/config.yaml",
+			fake:       validFakeFactory,
+			wantConfig: validConfig,
+		}, {
+			name:       "valid and present config in bucket with underscores",
+			path:       "gs://bucket_with_underscore/dir/config.yaml",
+			fake:       validFakeFactory,
+			wantConfig: validConfig,
+		}, {
+
 			name:      "bad path",
 			path:      "gs://path/to/nowhere.yaml",
 			fake:      validFakeFactory,
@@ -663,7 +679,7 @@ func TestNewReceiver(t *testing.T) {
 		Tags:          []string{t.Name()},
 		Images:        []string{"gcr.io/example/image"},
 	}
-	sentBuildV2 := proto.MessageV2(sentBuild)
+	sentBuildV2 := protoadapt.MessageV2Of(sentBuild)
 	sentJSON, err := protojson.Marshal(sentBuildV2)
 	if err != nil {
 		t.Fatal(err)
@@ -727,7 +743,7 @@ func wrapperToBuffer(t *testing.T, w *pubSubPushWrapper) *bytes.Buffer {
 
 func buildToBuffer(t *testing.T, b *cbpb.Build) *bytes.Buffer {
 	t.Helper()
-	b2 := proto.MessageV2(b)
+	b2 := protoadapt.MessageV2Of(b)
 	j, err := protojson.Marshal(b2)
 	if err != nil {
 		t.Fatal(err)
@@ -817,9 +833,10 @@ func TestReceiverWithIgnoredBadMessage(t *testing.T) {
 
 func TestParseTemplate(t *testing.T) {
 	ctx := context.Background()
+	validTemplate := `{{.Build.Status}} {{ replace "bye world" "bye" "hello"}}`
 	validFakeFactory := &fakeGCSReaderFactory{
 		data: map[string]string{
-			"gs://path/to/my/template.yaml": "{{.Build.Status}}",
+			"gs://path/to/my/template.yaml": validTemplate,
 		},
 	}
 	for _, tc := range []struct {
@@ -834,14 +851,14 @@ func TestParseTemplate(t *testing.T) {
 				Type: "golang",
 				URI:  "gs://path/to/my/template.yaml",
 			},
-			want: "{{.Build.Status}}",
+			want: validTemplate,
 		}, {
 			name: "valid content",
 			tmpl: &Template{
 				Type:    "golang",
-				Content: "{{.Build.Status}}",
+				Content: validTemplate,
 			},
-			want: "{{.Build.Status}}",
+			want: validTemplate,
 		}, {
 			name: "invalid URI",
 			tmpl: &Template{
